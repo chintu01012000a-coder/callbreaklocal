@@ -116,6 +116,10 @@ let showHistory=false;
 const pageLoadTs=Date.now();
 const handled=new Set();
 function once(key){ if(handled.has(key)) return false; handled.add(key); return true; }
+function onceAsync(key, fn){
+  if(!once(key)) return;
+  Promise.resolve().then(fn).catch(e=>{ handled.delete(key); console.error('action failed, will retry:', key, e); });
+}
 
 function mySeat(){ return room && room.players ? room.players.findIndex(p=>p.uid===myUid) : -1; }
 function seatToAct(){ return ((room.leaderSeat||0) + (room.currentTrick||[]).length) % 4; }
@@ -170,7 +174,7 @@ async function doCreate(humanCount){
   await roomRef.set({
     createdAt: Date.now(), hostUid: myUid, humanCount,
     players,
-    phase:'waiting', round:0, dealerSeat:0, trumpChooserSeat:1,
+    phase:'waiting', round:0, dealSeq:0, dealerSeat:0, trumpChooserSeat:1,
     trumpSuit:null, sideOf:{}, currentTrick:[], leaderSeat:0, trickNum:1,
     tricksWon:{}, scores:{}, revealedBids:{}, roundScores:{}, history:[],
     readyPlayers:{}, cancelReason:''
@@ -204,22 +208,23 @@ function subscribe(){
 
 function onRoomChange(){
   if(!room){ render(); return; }
+  const seq=room.dealSeq||0;
 
-  if(room.phase==='trump' && !room.trumpSuit && isBotUid(room.players[room.trumpChooserSeat].uid) && myUid===room.hostUid && once('trumpbot-'+room.round)){
-    roomRef.update({trumpSuit: SUITS[Math.floor(Math.random()*4)].key});
+  if(room.phase==='trump' && !room.trumpSuit && isBotUid(room.players[room.trumpChooserSeat].uid) && myUid===room.hostUid){
+    onceAsync('trumpbot-'+seq, ()=>roomRef.update({trumpSuit: SUITS[Math.floor(Math.random()*4)].key}));
   }
-  if(room.phase==='trump' && room.trumpSuit && iAmResponsibleForSeat(room.dealerSeat) && once('deal-'+room.round)){
-    performDeal();
+  if(room.phase==='trump' && room.trumpSuit && iAmResponsibleForSeat(room.dealerSeat)){
+    onceAsync('deal-'+seq, performDeal);
   }
   if(room.phase==='bidding'){
     room.players.forEach(p=>{
-      if(isBotUid(p.uid) && myUid===room.hostUid && !(room.readyPlayers&&room.readyPlayers[p.uid]) && once('botbid-'+p.uid+'-'+room.round)){
-        doBotBid(p.uid);
+      if(isBotUid(p.uid) && myUid===room.hostUid && !(room.readyPlayers&&room.readyPlayers[p.uid])){
+        onceAsync('botbid-'+p.uid+'-'+seq, ()=>doBotBid(p.uid));
       }
     });
     const ready=room.readyPlayers||{};
-    if(room.players.every(p=>ready[p.uid]) && once('start-'+room.round)){
-      tryStartPlaying();
+    if(room.players.every(p=>ready[p.uid])){
+      onceAsync('start-'+seq, tryStartPlaying);
     }
   }
   if(room.phase==='playing' && (room.currentTrick||[]).length<4){
@@ -229,17 +234,17 @@ function onRoomChange(){
       setTimeout(()=>{ doBotPlay(p.uid, seat).finally(()=>{ botMoving=false; onRoomChange(); }); }, 500);
     }
   }
-  if(room.phase==='playing' && (room.currentTrick||[]).length===4 && once('trickfull-'+room.round+'-'+room.trickNum)){
-    setTimeout(resolveCurrentTrick, 2000);
+  if(room.phase==='playing' && (room.currentTrick||[]).length===4){
+    onceAsync('trickfull-'+seq+'-'+room.trickNum, ()=>new Promise(res=>setTimeout(()=>resolveCurrentTrick().then(res).catch(res),2000)));
   }
   if(room.cancelRequest){
     room.players.forEach(p=>{
-      if(isBotUid(p.uid) && myUid===room.hostUid && !room.cancelRequest.votes[p.uid] && once('cancelbotvote-'+p.uid+'-'+room.cancelRequest.id)){
-        roomRef.update({['cancelRequest.votes.'+p.uid]:true});
+      if(isBotUid(p.uid) && myUid===room.hostUid && !room.cancelRequest.votes[p.uid]){
+        onceAsync('cancelbotvote-'+p.uid+'-'+room.cancelRequest.id, ()=>roomRef.update({['cancelRequest.votes.'+p.uid]:true}));
       }
     });
-    if(room.players.every(p=>room.cancelRequest.votes[p.uid]) && once('cancelapply-'+room.cancelRequest.id)){
-      applyCancelRound();
+    if(room.players.every(p=>room.cancelRequest.votes[p.uid])){
+      onceAsync('cancelapply-'+room.cancelRequest.id, applyCancelRound);
     }
   }
   if(room.phase==='collecting'){
@@ -247,13 +252,13 @@ function onRoomChange(){
       roomRef.update({['revealedBids.'+myUid]: myHand.bid});
     }
     room.players.forEach(p=>{
-      if(isBotUid(p.uid) && myUid===room.hostUid && !(room.revealedBids&&room.revealedBids[p.uid]!=null) && once('botreveal-'+p.uid+'-'+room.round)){
-        revealBotBid(p.uid);
+      if(isBotUid(p.uid) && myUid===room.hostUid && !(room.revealedBids&&room.revealedBids[p.uid]!=null)){
+        onceAsync('botreveal-'+p.uid+'-'+seq, ()=>revealBotBid(p.uid));
       }
     });
     const uids=room.players.map(p=>p.uid);
-    if(uids.every(u=>room.revealedBids&&room.revealedBids[u]!=null) && once('finish-'+room.round)){
-      tryFinishRound();
+    if(uids.every(u=>room.revealedBids&&room.revealedBids[u]!=null)){
+      onceAsync('finish-'+seq, tryFinishRound);
     }
   }
   render();
@@ -276,24 +281,22 @@ async function performDeal(){
     sideOf[p.uid]=nonTrump.some(suit=>hands[i].filter(c=>c.suit===suit).length===0);
     tricksWon[p.uid]=0;
   });
-  const claimed = await db.runTransaction(async tx=>{
+  await db.runTransaction(async tx=>{
     const snap=await tx.get(roomRef); const d=snap.data();
-    if(d.phase!=='trump' || d.trumpSuit!==room.trumpSuit) return false;
+    if(d.phase!=='trump' || d.trumpSuit!==room.trumpSuit) return;
     tx.update(roomRef, {phase:'bidding', sideOf, tricksWon, revealedBids:{}, currentTrick:[], leaderSeat:d.trumpChooserSeat, trickNum:1, readyPlayers:{}, cancelReason:''});
-    return true;
+    room.players.forEach((p,i)=>{ tx.set(roomRef.collection('hands').doc(p.uid), {cards:hands[i], bid:null}); });
   });
-  if(!claimed) return;
-  const batch=db.batch();
-  room.players.forEach((p,i)=>{ batch.set(roomRef.collection('hands').doc(p.uid), {cards:hands[i], bid:null}); });
-  await batch.commit();
 }
 
 async function doBotBid(uid){
   const snap=await roomRef.collection('hands').doc(uid).get();
   const hand=snap.data().cards;
   const bid=estimateBid(hand, room.trumpSuit);
-  await roomRef.collection('hands').doc(uid).update({bid});
-  await roomRef.update({['readyPlayers.'+uid]:true});
+  const batch=db.batch();
+  batch.update(roomRef.collection('hands').doc(uid), {bid});
+  batch.update(roomRef, {['readyPlayers.'+uid]:true});
+  await batch.commit();
 }
 
 async function revealBotBid(uid){
@@ -337,7 +340,7 @@ async function tryFinishRound(){
 
 async function startGame(){
   const scores={}; room.players.forEach(p=>scores[p.uid]=0);
-  await roomRef.update({phase:'trump', round:1, dealerSeat:0, trumpChooserSeat:1, trumpSuit:null, scores});
+  await roomRef.update({phase:'trump', round:1, dealSeq:1, dealerSeat:0, trumpChooserSeat:1, trumpSuit:null, scores});
 }
 
 async function chooseTrump(idx){
@@ -354,19 +357,17 @@ async function markReady(){
 }
 
 async function executePlay(uid, seat, card, currentHandCards){
-  const committed = await db.runTransaction(async tx=>{
+  await db.runTransaction(async tx=>{
     const snap=await tx.get(roomRef); const d=snap.data();
-    if(d.phase!=='playing') return false;
+    if(d.phase!=='playing') return;
     const trick=(d.currentTrick||[]).slice();
-    if(trick.length>=4) return false;
-    if(((d.leaderSeat||0)+trick.length)%4 !== seat) return false;
+    if(trick.length>=4) return;
+    if(((d.leaderSeat||0)+trick.length)%4 !== seat) return;
     trick.push({uid, seat, card});
     tx.update(roomRef, {currentTrick:trick});
-    return true;
+    const newCards=currentHandCards.filter(c=>!(c.suit===card.suit&&c.rank===card.rank));
+    tx.update(roomRef.collection('hands').doc(uid), {cards:newCards});
   });
-  if(!committed) return;
-  const newCards=currentHandCards.filter(c=>!(c.suit===card.suit&&c.rank===card.rank));
-  await roomRef.collection('hands').doc(uid).update({cards:newCards});
 }
 
 async function resolveCurrentTrick(){
@@ -397,7 +398,7 @@ async function nextRound(){
     const snap=await tx.get(roomRef); const d=snap.data();
     if(d.phase!=='reveal') return;
     const dealerSeat=(d.dealerSeat+1)%4;
-    tx.update(roomRef,{phase:'trump', round:d.round+1, dealerSeat, trumpChooserSeat:(dealerSeat+1)%4, trumpSuit:null, cancelReason:''});
+    tx.update(roomRef,{phase:'trump', round:d.round+1, dealSeq:(d.dealSeq||0)+1, dealerSeat, trumpChooserSeat:(dealerSeat+1)%4, trumpSuit:null, cancelReason:''});
   });
 }
 
@@ -415,7 +416,7 @@ async function applyCancelRound(){
   await db.runTransaction(async tx=>{
     const snap=await tx.get(roomRef); const d=snap.data();
     if(!d.cancelRequest) return;
-    tx.update(roomRef,{phase:'trump', trumpSuit:null, trumpChooserSeat:(d.dealerSeat+1)%4, cancelRequest:null, cancelReason:''});
+    tx.update(roomRef,{phase:'trump', trumpSuit:null, dealSeq:(d.dealSeq||0)+1, trumpChooserSeat:(d.dealerSeat+1)%4, cancelRequest:null, cancelReason:''});
   });
 }
 
